@@ -61,6 +61,8 @@ fn total_node_builder(size: u64, children: Vec<Node>) -> Node {
         children,
         inode_device: None,
         depth: 0,
+        kind: crate::node::EntryKind::File,
+        size_known: true,
     }
 }
 
@@ -205,6 +207,8 @@ fn handle_duplicate_top_level_names(top_level_nodes: Vec<Node>, short_paths: boo
                             children: node.children.clone(),
                             inode_device: node.inode_device,
                             depth: node.depth,
+                            kind: node.kind,
+                            size_known: node.size_known,
                         };
                         newer.push(n)
                     }

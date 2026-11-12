@@ -1,14 +1,6 @@
-mod cli;
-mod config;
-mod dir_walker;
-mod display;
-mod display_node;
-mod filter;
-mod filter_type;
-mod node;
-mod platform;
-mod progress;
-mod utils;
+use du_dust::{
+    cli, config, dir_walker, display, display_node, filter, filter_type, progress, utils,
+};
 
 use crate::cli::Cli;
 use crate::config::Config;
@@ -271,6 +263,8 @@ fn main() {
         progress_data: indicator.data.clone(),
         errors: errors_for_rayon,
         has_any_filter,
+        scan_mode: false,
+        cancellation: None,
     };
 
     let threads_to_use = config.get_threads(&options);

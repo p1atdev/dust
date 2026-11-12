@@ -241,3 +241,69 @@ pub fn tuple_from_metadata(
         None
     }
 }
+
+/// Exact metadata for the library API. Errors remain errors; allocated bytes
+/// are never silently replaced with apparent size or a heuristic estimate.
+#[cfg(unix)]
+pub(crate) fn scan_metadata(
+    _path: &Path,
+    md: &fs::Metadata,
+    apparent: bool,
+) -> std::io::Result<MetadataTuple> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((
+        if apparent {
+            md.len()
+        } else {
+            md.blocks()
+                .checked_mul(512)
+                .ok_or_else(|| std::io::Error::other("allocated size overflow"))?
+        },
+        Some((md.ino(), md.dev())),
+        (md.mtime(), md.atime(), md.ctime()),
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn scan_metadata(
+    path: &Path,
+    _md: &fs::Metadata,
+    apparent: bool,
+) -> std::io::Result<MetadataTuple> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    // Attribute-only access avoids reading file contents or hydrating cloud files.
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // Both buffers have the exact layout and size required by these Win32 calls.
+    unsafe {
+        if GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        ) == 0
+            || GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let size = if apparent {
+        standard.EndOfFile
+    } else {
+        standard.AllocationSize
+    };
+    Ok((
+        u64::try_from(size).map_err(|_| std::io::Error::other("negative file size"))?,
+        Some((
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            u64::from(info.dwVolumeSerialNumber),
+        )),
+        (0, 0, 0),
+    ))
+}

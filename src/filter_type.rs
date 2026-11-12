@@ -112,6 +112,8 @@ mod tests {
             children: vec![],
             inode_device: None,
             depth: 1,
+            kind: crate::node::EntryKind::File,
+            size_known: true,
         }
     }
 

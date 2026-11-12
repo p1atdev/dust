@@ -4,7 +4,7 @@ use std::io::Error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::node::Node;
 use crate::progress::ORDERING;
@@ -57,6 +57,16 @@ pub struct WalkData<'a> {
     // path in `process_entry` can skip the function call entirely when no
     // filter flags are set.
     pub has_any_filter: bool,
+    /// Library scans retain raw entries and report every metadata error.
+    pub scan_mode: bool,
+    pub cancellation: Option<&'a AtomicBool>,
+}
+
+impl WalkData<'_> {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(|flag| flag.load(AtomicOrdering::Relaxed))
+    }
 }
 
 // Per-directory bookkeeping used during the parallel walk. Each directory gets
@@ -84,6 +94,14 @@ struct PendingDir {
 }
 
 pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
+    walk_impl(dirs, walk_data, true)
+}
+
+pub fn walk_raw(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
+    walk_impl(dirs, walk_data, false)
+}
+
+fn walk_impl(dirs: HashSet<PathBuf>, walk_data: &WalkData, aggregate: bool) -> Vec<Node> {
     // FxHash is substantially faster than std's default SipHash on small
     // primitive keys. DoS resistance is irrelevant here; the keys are
     // (inode, device) pairs from the filesystem, not user input.
@@ -91,6 +109,9 @@ pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
     let mut top_level_nodes: Vec<Node> = Vec::new();
 
     for d in dirs {
+        if walk_data.is_cancelled() {
+            break;
+        }
         walk_data.progress_data.clear_state(&d);
 
         // A root passed on the command line that *is* a symlink-to-dir gets
@@ -139,10 +160,14 @@ pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
             .store(Operation::PREPARING, ORDERING);
 
         let mut outer_children = std::mem::take(&mut *outer.children.lock().unwrap());
-        if let Some(node) = outer_children.pop()
-            && let Some(cleaned) = clean_inodes(node, &mut inodes, walk_data)
-        {
-            top_level_nodes.push(cleaned);
+        if let Some(node) = outer_children.pop() {
+            if aggregate {
+                if let Some(cleaned) = clean_inodes(node, &mut inodes, walk_data) {
+                    top_level_nodes.push(cleaned);
+                }
+            } else {
+                top_level_nodes.push(node);
+            }
         }
     }
     top_level_nodes
@@ -184,6 +209,8 @@ fn clean_inodes(x: Node, inodes: &mut FxHashSet<(u64, u64)>, walk_data: &WalkDat
         children: new_children,
         inode_device: x.inode_device,
         depth: x.depth,
+        kind: x.kind,
+        size_known: x.size_known,
     })
 }
 
@@ -316,16 +343,33 @@ fn walk_dir<'scope>(
     pending: Arc<PendingDir>,
     walk_data: &'scope WalkData<'scope>,
 ) {
+    if walk_data.is_cancelled() {
+        finalize_chain(pending, walk_data);
+        return;
+    }
     let md_result = if pending.is_symlink {
         fs::metadata(&pending.dir)
     } else {
         fs::symlink_metadata(&pending.dir)
     };
+    if let Err(error) = &md_result {
+        record_error(error, &pending.dir, walk_data);
+    }
     let (is_dir_path, is_file_path, tuple) = match &md_result {
         Ok(m) => (
             m.is_dir(),
             m.is_file(),
-            tuple_from_metadata(m, walk_data.use_apparent_size),
+            if walk_data.scan_mode {
+                match crate::platform::scan_metadata(&pending.dir, m, walk_data.use_apparent_size) {
+                    Ok(tuple) => Some(tuple),
+                    Err(error) => {
+                        record_error(&error, &pending.dir, walk_data);
+                        None
+                    }
+                }
+            } else {
+                tuple_from_metadata(m, walk_data.use_apparent_size)
+            },
         ),
         Err(_) => (false, false, None),
     };
@@ -335,6 +379,9 @@ fn walk_dir<'scope>(
         // EINTR is the only retryable error. Looping iteratively (rather than
         // recursing on retry, like the old code) keeps stack depth O(1).
         loop {
+            if walk_data.is_cancelled() {
+                break;
+            }
             let entries = match fs::read_dir(&pending.dir) {
                 Ok(entries) => entries,
                 Err(ref failed) => {
@@ -350,7 +397,7 @@ fn walk_dir<'scope>(
             // This is the load-bearing structural choice for retry safety: if
             // we decide to retry, we throw the Vec away and re-list, with no
             // spawned subdir tasks or pushed file nodes to roll back.
-            let collected: Vec<_> = entries.collect();
+            let collected: Vec<_> = entries.take_while(|_| !walk_data.is_cancelled()).collect();
 
             // If any entry yielded a retryable error, throw the Vec away and
             // re-list. We record only that one error (which bumps the EINTR
@@ -422,8 +469,17 @@ fn process_entry<'scope>(
     // `entry.path()` allocates a PathBuf; `entry.file_type()` can require a
     // stat on filesystems without d_type support. Previously each was called
     // up to 3 times per entry.
+    if walk_data.is_cancelled() {
+        return None;
+    }
     let path = entry.path();
-    let file_type = entry.file_type().ok()?;
+    let file_type = match entry.file_type() {
+        Ok(kind) => kind,
+        Err(error) => {
+            record_error(&error, &path, walk_data);
+            return None;
+        }
+    };
     // Fetch metadata at most once per entry. Without filters, the
     // per-file stat lives inside `build_node` as before. With filters,
     // we used to stat twice — once in `ignore_file` for the filter
@@ -442,7 +498,19 @@ fn process_entry<'scope>(
     if walk_data.has_any_filter {
         if filter_needs_metadata(walk_data) {
             let follow_links = walk_data.follow_links && file_type.is_symlink();
-            prefetched = get_metadata(&path, walk_data.use_apparent_size, follow_links);
+            prefetched = if walk_data.scan_mode {
+                match fs::symlink_metadata(&path).and_then(|md| {
+                    crate::platform::scan_metadata(&path, &md, walk_data.use_apparent_size)
+                }) {
+                    Ok(tuple) => Some(tuple),
+                    Err(error) => {
+                        record_error(&error, &path, walk_data);
+                        None
+                    }
+                }
+            } else {
+                get_metadata(&path, walk_data.use_apparent_size, follow_links)
+            };
         }
         if ignore_file(entry, &path, file_type, prefetched.as_ref(), walk_data) {
             return None;
@@ -450,7 +518,7 @@ fn process_entry<'scope>(
     } else if walk_data.ignore_hidden && entry.file_name().to_str().unwrap_or("").starts_with('.') {
         return None;
     }
-    let data = entry.file_type().ok()?;
+    let data = file_type;
     let is_symlink = data.is_symlink();
 
     // If the entry is a directory we'll spawn off a new task to walk it.
@@ -531,7 +599,13 @@ fn process_entry<'scope>(
         data.is_file(),
         pending.depth,
         walk_data,
-    );
+    )
+    .map(|mut node| {
+        if walk_data.scan_mode && !is_symlink && !data.is_file() {
+            node.kind = crate::node::EntryKind::Other;
+        }
+        node
+    });
 
     let prog_data = &walk_data.progress_data;
     prog_data.num_files.fetch_add(1, ORDERING);
@@ -603,8 +677,15 @@ fn is_retryable(failed: &Error) -> bool {
     failed.kind() == std::io::ErrorKind::Interrupted
 }
 
-fn record_error(failed: &Error, dir: &Path, walk_data: &WalkData) {
+pub(crate) fn record_error(failed: &Error, dir: &Path, walk_data: &WalkData) {
     let mut editable_error = walk_data.errors.lock().unwrap();
+    if walk_data.scan_mode && failed.kind() != std::io::ErrorKind::Interrupted {
+        editable_error.scan_issues.push(crate::scanner::ScanIssue {
+            path: dir.to_path_buf(),
+            kind: failed.kind(),
+            message: failed.to_string(),
+        });
+    }
     match failed.kind() {
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput => {
             editable_error
@@ -644,6 +725,8 @@ mod tests {
             children: vec![],
             inode_device: Some((5, 6)),
             depth: 0,
+            kind: crate::node::EntryKind::File,
+            size_known: true,
         }
     }
 
@@ -667,6 +750,8 @@ mod tests {
             progress_data: indicator.data.clone(),
             errors: Arc::new(Mutex::new(RuntimeErrors::default())),
             has_any_filter: true,
+            scan_mode: false,
+            cancellation: None,
         }
     }
 
@@ -715,6 +800,8 @@ mod tests {
             children: vec![],
             inode_device: Some((3, 66310)),
             depth: 0,
+            kind: crate::node::EntryKind::File,
+            size_known: true,
         };
 
         let b = Node {
@@ -723,6 +810,8 @@ mod tests {
             children: vec![],
             inode_device: None,
             depth: 0,
+            kind: crate::node::EntryKind::File,
+            size_known: true,
         };
 
         let c = Node {
@@ -731,6 +820,8 @@ mod tests {
             children: vec![],
             inode_device: Some((1, 66310)),
             depth: 0,
+            kind: crate::node::EntryKind::File,
+            size_known: true,
         };
 
         assert_eq!(sort_by_inode(&a, &b), Ordering::Greater);

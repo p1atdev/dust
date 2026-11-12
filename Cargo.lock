@@ -321,6 +321,7 @@ dependencies = [
  "thousands",
  "unicode-width",
  "winapi-util",
+ "windows-sys",
 ]
 
 [[package]]

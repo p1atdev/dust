@@ -7,6 +7,14 @@ use crate::utils::is_filtered_out_due_to_regex;
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum EntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
 #[derive(Debug, Eq, Clone)]
 pub struct Node {
     pub name: PathBuf,
@@ -14,6 +22,8 @@ pub struct Node {
     pub children: Vec<Node>,
     pub inode_device: Option<(u64, u64)>,
     pub depth: usize,
+    pub kind: EntryKind,
+    pub size_known: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -49,6 +59,40 @@ pub fn build_node(
     depth: usize,
     walk_data: &WalkData,
 ) -> Option<Node> {
+    let kind = if is_symlink {
+        EntryKind::Symlink
+    } else if is_file {
+        EntryKind::File
+    } else {
+        EntryKind::Directory
+    };
+    if walk_data.scan_mode {
+        let data = match cached {
+            Some(data) => Ok(data),
+            None => std::fs::symlink_metadata(&dir).and_then(|md| {
+                crate::platform::scan_metadata(&dir, &md, walk_data.use_apparent_size)
+            }),
+        };
+        return Some(match data {
+            Ok(data) => {
+                let mut node = node_from_tuple(dir, children, data, is_file, depth, walk_data);
+                node.kind = kind;
+                node
+            }
+            Err(error) => {
+                crate::dir_walker::record_error(&error, &dir, walk_data);
+                Node {
+                    name: dir,
+                    size: 0,
+                    children,
+                    inode_device: None,
+                    depth,
+                    kind,
+                    size_known: false,
+                }
+            }
+        });
+    }
     let data = match cached {
         Some(t) => t,
         None => get_metadata(
@@ -106,6 +150,12 @@ fn node_from_tuple(
         children,
         inode_device,
         depth,
+        kind: if is_file {
+            EntryKind::File
+        } else {
+            EntryKind::Directory
+        },
+        size_known: true,
     }
 }
 
